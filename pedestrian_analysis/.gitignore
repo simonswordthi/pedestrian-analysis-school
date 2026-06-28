@@ -1,0 +1,9 @@
+# Ignore raw video files and large binary outputs
+data/videos/*.mp4
+data/videos/*.mov
+data/videos/*.avi
+data/calibration/*.npy
+outputs/
+__pycache__/
+*.pyc
+.DS_Store
