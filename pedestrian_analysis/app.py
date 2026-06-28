@@ -6,8 +6,11 @@ Run with:
 
 from __future__ import annotations
 
+import json
 import os
+import shutil
 import tempfile
+from datetime import datetime
 
 import gradio as gr
 import numpy as np
@@ -53,12 +56,103 @@ from pedestrian_analysis.visualization.export import export_all_figures
 import cv2
 
 
+_PACKAGE_DIR = os.path.dirname(os.path.abspath(__file__))
+_DATA_DIR = os.path.join(_PACKAGE_DIR, "data")
+_CALIBRATION_DIR = os.path.join(_DATA_DIR, "calibration")
+_TRAJECTORY_DIR = os.path.join(_DATA_DIR, "trajectories")
+_VIDEO_DIR = os.path.join(_DATA_DIR, "videos")
+_UPLOAD_DIR = os.path.join(_DATA_DIR, "uploads")
+
+
+def _ensure_project_dirs() -> None:
+    for path in (_CALIBRATION_DIR, _TRAJECTORY_DIR, _VIDEO_DIR, _UPLOAD_DIR):
+        os.makedirs(path, exist_ok=True)
+
+
+def _timestamp() -> str:
+    return datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+
+
+def _as_path(value: str | os.PathLike[str] | None) -> str | None:
+    if value is None:
+        return None
+    return os.fspath(value)
+
+
+def _copy_uploaded_file(src_path: str | os.PathLike[str], dest_dir: str, prefix: str) -> str:
+    _ensure_project_dirs()
+    source = os.fspath(src_path)
+    _, ext = os.path.splitext(source)
+    if not ext:
+        ext = ".bin"
+    dest_path = os.path.join(dest_dir, f"{prefix}_{_timestamp()}{ext}")
+    shutil.copy2(source, dest_path)
+    return dest_path
+
+
+def _points_to_dataframe(points: list[list[float]]) -> pd.DataFrame:
+    rows = []
+    for index in range(4):
+        if index < len(points):
+            x_val, y_val = points[index]
+        else:
+            x_val, y_val = np.nan, np.nan
+        rows.append({"px": float(x_val), "py": float(y_val)})
+    return pd.DataFrame(rows)
+
+
+def _parse_click_state(points_json: str | None) -> list[list[float]]:
+    if not points_json:
+        return []
+    try:
+        points = json.loads(points_json)
+    except json.JSONDecodeError:
+        return []
+    if not isinstance(points, list):
+        return []
+
+    cleaned: list[list[float]] = []
+    for point in points:
+        if isinstance(point, (list, tuple)) and len(point) == 2:
+            try:
+                cleaned.append([float(point[0]), float(point[1])])
+            except (TypeError, ValueError):
+                continue
+    return cleaned[:4]
+
+
+def _render_click_preview(frame_path: str | None, points: list[list[float]]) -> np.ndarray | None:
+    if frame_path is None or not os.path.isfile(frame_path):
+        return None
+
+    image = cv2.imread(frame_path)
+    if image is None:
+        return None
+
+    preview = image.copy()
+    for index, point in enumerate(points[:4], start=1):
+        x_px, y_px = int(round(point[0])), int(round(point[1]))
+        cv2.circle(preview, (x_px, y_px), 8, (0, 0, 255), -1)
+        cv2.putText(
+            preview,
+            str(index),
+            (x_px + 10, y_px - 10),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.8,
+            (0, 0, 255),
+            2,
+            cv2.LINE_AA,
+        )
+
+    return preview
+
+
 # ---------------------------------------------------------------------------
 # Tab 1 helpers
 # ---------------------------------------------------------------------------
 
 def _run_calibration(
-    frame_img: np.ndarray | None,
+    frame_img: str | None,
     pixel_df: pd.DataFrame,
     meter_df: pd.DataFrame,
     grid_spacing: float,
@@ -67,6 +161,14 @@ def _run_calibration(
     if frame_img is None:
         raise gr.Error("Please upload a video frame image.")
 
+    frame_path = _as_path(frame_img)
+    if frame_path is None or not os.path.isfile(frame_path):
+        raise gr.Error("Please upload a valid video frame image.")
+
+    frame = cv2.imread(frame_path)
+    if frame is None:
+        raise gr.Error("Could not read the uploaded frame image.")
+
     try:
         src = pixel_df[["px", "py"]].values.astype(np.float32)
         dst = meter_df[["x_m", "y_m"]].values.astype(np.float32)
@@ -74,11 +176,44 @@ def _run_calibration(
     except Exception as exc:
         raise gr.Error(f"Calibration failed: {exc}") from exc
 
-    bev = validate_calibration(frame_img, H, grid_spacing_m=grid_spacing)
+    bev = validate_calibration(frame, H, grid_spacing_m=grid_spacing)
 
-    npy_path = os.path.join(tempfile.mkdtemp(), "homography.npy")
+    _ensure_project_dirs()
+    _copy_uploaded_file(frame_path, _CALIBRATION_DIR, "calibration_frame")
+
+    stamp = _timestamp()
+    npy_path = os.path.join(_CALIBRATION_DIR, f"homography_{stamp}.npy")
     save_calibration(H, npy_path)
+
+    params_path = os.path.join(_CALIBRATION_DIR, f"calibration_params_{stamp}.json")
+    params_payload = {
+        "pixel_points": pixel_df[["px", "py"]].to_dict(orient="records"),
+        "meter_points": meter_df[["x_m", "y_m"]].to_dict(orient="records"),
+        "grid_spacing_m": float(grid_spacing),
+        "homography_file": os.path.basename(npy_path),
+    }
+    with open(params_path, "w", encoding="utf-8") as params_file:
+        json.dump(params_payload, params_file, ensure_ascii=False, indent=2)
+
     return bev, npy_path
+
+
+def _sync_clicked_points(
+    frame_img: str | None,
+    points_json: str | None,
+) -> tuple[pd.DataFrame, np.ndarray | None, str]:
+    points = _parse_click_state(points_json)
+    if not points:
+        return (
+            _DEFAULT_PIXEL_PTS.copy(),
+            _render_click_preview(_as_path(frame_img), []),
+            "Klicke 4 Referenzpunkte der Reihe nach in das Bild.",
+        )
+
+    pixel_df = _points_to_dataframe(points)
+    preview = _render_click_preview(_as_path(frame_img), points)
+    status = f"Referenzpunkte gesetzt: {len(points)}/4"
+    return pixel_df, preview, status
 
 
 # ---------------------------------------------------------------------------
@@ -103,6 +238,9 @@ def _run_analysis(
     if calib_file is None:
         raise gr.Error("Please upload a calibration .npy file.")
 
+    _ensure_project_dirs()
+    saved_video_path = _copy_uploaded_file(video_file, _VIDEO_DIR, "video")
+
     try:
         H = load_calibration(calib_file)
     except Exception as exc:
@@ -115,7 +253,7 @@ def _run_analysis(
 
     try:
         df = extract_trajectories_from_video(
-            video_path=video_file,
+            video_path=saved_video_path,
             H=H,
             confidence_threshold=confidence,
             frame_skip=int(frame_skip),
@@ -143,7 +281,7 @@ def _run_analysis(
     df = compute_alignment(df)
     df = compute_separation(df)
 
-    csv_path = os.path.join(tempfile.mkdtemp(), "trajectories.csv")
+    csv_path = os.path.join(_TRAJECTORY_DIR, f"trajectories_{_timestamp()}.csv")
     save_trajectories(df, csv_path)
 
     progress(1.0, desc="Done.")
@@ -306,7 +444,70 @@ _DEFAULT_METER_PTS = pd.DataFrame(
     {"x_m": [0.0, 4.0, 4.0, 0.0], "y_m": [0.0, 0.0, 3.0, 3.0]}
 )
 
-with gr.Blocks(title="Pedestrian Crossing Analysis", theme=gr.themes.Default()) as demo:
+click_sync_js = r"""
+(() => {
+    const bindCalibrationClicks = () => {
+        const root = document.getElementById('calib-frame');
+        const state = document.querySelector('#calib-points-state textarea, #calib-points-state input');
+        if (!root || !state) {
+            return false;
+        }
+
+        const img = root.querySelector('img');
+        if (!img || img.dataset.clickBound === '1') {
+            return false;
+        }
+
+        img.dataset.clickBound = '1';
+        img.style.cursor = 'crosshair';
+        img.addEventListener('click', (event) => {
+            const rect = img.getBoundingClientRect();
+            if (!rect.width || !rect.height) {
+                return;
+            }
+
+            let points = [];
+            try {
+                points = state.value ? JSON.parse(state.value) : [];
+            } catch (error) {
+                points = [];
+            }
+
+            if (!Array.isArray(points)) {
+                points = [];
+            }
+            if (points.length >= 4) {
+                return;
+            }
+
+            const scaleX = (img.naturalWidth || rect.width) / rect.width;
+            const scaleY = (img.naturalHeight || rect.height) / rect.height;
+            const x = (event.clientX - rect.left) * scaleX;
+            const y = (event.clientY - rect.top) * scaleY;
+
+            points.push([
+                Math.round(x * 1000) / 1000,
+                Math.round(y * 1000) / 1000,
+            ]);
+
+            state.value = JSON.stringify(points);
+            state.dispatchEvent(new Event('input', { bubbles: true }));
+        });
+
+        return true;
+    };
+
+    const interval = setInterval(() => {
+        if (bindCalibrationClicks()) {
+            clearInterval(interval);
+        }
+    }, 250);
+
+    bindCalibrationClicks();
+})();
+"""
+
+with gr.Blocks(title="Pedestrian Crossing Analysis", theme=gr.themes.Default(), js=click_sync_js) as demo:
     gr.Markdown("# 🚶 Pedestrian Crossing Trajectory Analysis")
     gr.Markdown(
         "Analyse drone-captured BEV footage of pedestrian crossing scenarios. "
@@ -318,13 +519,29 @@ with gr.Blocks(title="Pedestrian Crossing Analysis", theme=gr.themes.Default()) 
         gr.Markdown("### Camera → Ground-plane Homography Calibration")
         with gr.Row():
             with gr.Column():
-                calib_frame = gr.Image(label="Video Frame (upload as image)", type="numpy")
+                calib_frame = gr.Image(
+                    label="Video Frame (upload as image)",
+                    type="filepath",
+                    sources=["upload"],
+                    elem_id="calib-frame",
+                )
+                calib_points_state = gr.Textbox(
+                    value="[]",
+                    visible=False,
+                    elem_id="calib-points-state",
+                )
                 pixel_pts_df = gr.Dataframe(
                     value=_DEFAULT_PIXEL_PTS,
                     label="4 Pixel Points (px, py)",
                     col_count=(2, "fixed"),
                     interactive=True,
                 )
+                point_status = gr.Textbox(
+                    value="Klicke 4 Referenzpunkte der Reihe nach in das Bild.",
+                    label="Punkt-Status",
+                    interactive=False,
+                )
+                click_preview = gr.Image(label="Klick-Vorschau", interactive=False)
                 meter_pts_df = gr.Dataframe(
                     value=_DEFAULT_METER_PTS,
                     label="4 Meter Points (x_m, y_m)",
@@ -339,6 +556,12 @@ with gr.Blocks(title="Pedestrian Crossing Analysis", theme=gr.themes.Default()) 
             with gr.Column():
                 bev_output = gr.Image(label="BEV Validation Grid")
                 calib_file_out = gr.File(label="Download Homography (.npy)")
+
+        calib_points_state.change(
+            fn=_sync_clicked_points,
+            inputs=[calib_frame, calib_points_state],
+            outputs=[pixel_pts_df, click_preview, point_status],
+        )
 
         calib_btn.click(
             fn=_run_calibration,

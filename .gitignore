@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyd
+*.so
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/*
+venv/
+env/
+
+# Editor / OS
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Project outputs and generated data
+pedestrian_analysis/data/calibration/*
+pedestrian_analysis/data/trajectories/*
+pedestrian_analysis/data/videos/*
+pedestrian_analysis/data/uploads/*
+pedestrian_analysis/outputs/*
+
+# Keep placeholder files if you decide to add them later
+!pedestrian_analysis/data/calibration/.gitkeep
+!pedestrian_analysis/data/trajectories/.gitkeep
+!pedestrian_analysis/data/videos/.gitkeep
+!pedestrian_analysis/data/uploads/.gitkeep
+!pedestrian_analysis/outputs/.gitkeep
