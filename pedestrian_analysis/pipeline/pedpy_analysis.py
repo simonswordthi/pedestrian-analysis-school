@@ -48,7 +48,7 @@ def compute_kinematics(
     speed_df = pedpy.compute_individual_speed(
         traj_data=traj_data,
         frame_step=frame_step,
-        speed_calculation=pedpy.SpeedCalculation.BORDER_SINGLE_SIDE,
+        speed_calculation=pedpy.SpeedCalculation.BORDER_SINGLE_SIDED,
     )
     # speed_df has columns: id, frame, speed
     speed_df = speed_df.rename(columns={"speed": "speed_ms"})

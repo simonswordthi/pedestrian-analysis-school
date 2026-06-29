@@ -62,6 +62,8 @@ _CALIBRATION_DIR = os.path.join(_DATA_DIR, "calibration")
 _TRAJECTORY_DIR = os.path.join(_DATA_DIR, "trajectories")
 _VIDEO_DIR = os.path.join(_DATA_DIR, "videos")
 _UPLOAD_DIR = os.path.join(_DATA_DIR, "uploads")
+_CALIBRATION_STATE_FILE = os.path.join(_CALIBRATION_DIR, "calibration_state.json")
+_CALIBRATION_IMAGE_FILE = os.path.join(_CALIBRATION_DIR, "current_calibration_image.png")
 
 
 def _ensure_project_dirs() -> None:
@@ -74,31 +76,25 @@ def _timestamp() -> str:
 
 
 def _as_path(value: str | os.PathLike[str] | None) -> str | None:
-    if value is None:
-        return None
-    return os.fspath(value)
+    return None if value is None else os.fspath(value)
 
 
 def _copy_uploaded_file(src_path: str | os.PathLike[str], dest_dir: str, prefix: str) -> str:
     _ensure_project_dirs()
     source = os.fspath(src_path)
     _, ext = os.path.splitext(source)
-    if not ext:
-        ext = ".bin"
-    dest_path = os.path.join(dest_dir, f"{prefix}_{_timestamp()}{ext}")
+    dest_path = os.path.join(dest_dir, f"{prefix}_{_timestamp()}{ext or '.bin'}")
     shutil.copy2(source, dest_path)
     return dest_path
 
 
+def _empty_pixel_points_df() -> pd.DataFrame:
+    return pd.DataFrame({"px": [np.nan] * 4, "py": [np.nan] * 4})
+
+
 def _points_to_dataframe(points: list[list[float]]) -> pd.DataFrame:
-    rows = []
-    for index in range(4):
-        if index < len(points):
-            x_val, y_val = points[index]
-        else:
-            x_val, y_val = np.nan, np.nan
-        rows.append({"px": float(x_val), "py": float(y_val)})
-    return pd.DataFrame(rows)
+    rows = points[:4] + [[np.nan, np.nan]] * max(0, 4 - len(points))
+    return pd.DataFrame(rows, columns=["px", "py"])
 
 
 def _parse_click_state(points_json: str | None) -> list[list[float]]:
@@ -110,7 +106,6 @@ def _parse_click_state(points_json: str | None) -> list[list[float]]:
         return []
     if not isinstance(points, list):
         return []
-
     cleaned: list[list[float]] = []
     for point in points:
         if isinstance(point, (list, tuple)) and len(point) == 2:
@@ -121,30 +116,400 @@ def _parse_click_state(points_json: str | None) -> list[list[float]]:
     return cleaned[:4]
 
 
-def _render_click_preview(frame_path: str | None, points: list[list[float]]) -> np.ndarray | None:
-    if frame_path is None or not os.path.isfile(frame_path):
-        return None
+def _image_to_data_url(image_path: str | None) -> str:
+    if image_path is None or not os.path.isfile(image_path):
+        return ""
+    import base64
 
-    image = cv2.imread(frame_path)
+    with open(image_path, "rb") as image_file:
+        encoded = base64.b64encode(image_file.read()).decode("ascii")
+    _, ext = os.path.splitext(image_path)
+    mime = "image/png" if ext.lower() in {"", ".png"} else f"image/{ext.lower().lstrip('.')}"
+    return f"data:{mime};base64,{encoded}"
+
+
+def _save_calibration_image(source_path: str | None) -> str | None:
+    source = _as_path(source_path)
+    if source is None or not os.path.isfile(source):
+        return None
+    image = cv2.imread(source)
     if image is None:
         return None
+    _ensure_project_dirs()
+    cv2.imwrite(_CALIBRATION_IMAGE_FILE, image)
+    return _CALIBRATION_IMAGE_FILE
 
-    preview = image.copy()
-    for index, point in enumerate(points[:4], start=1):
-        x_px, y_px = int(round(point[0])), int(round(point[1]))
-        cv2.circle(preview, (x_px, y_px), 8, (0, 0, 255), -1)
-        cv2.putText(
-            preview,
-            str(index),
-            (x_px + 10, y_px - 10),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.8,
-            (0, 0, 255),
-            2,
-            cv2.LINE_AA,
+
+def _load_calibration_state() -> dict:
+    default_state = {
+        "image_path": None,
+        "pixel_points": [],
+        "meter_points": _DEFAULT_METER_PTS.to_dict(orient="records"),
+        "grid_spacing_m": 1.0,
+    }
+    if not os.path.isfile(_CALIBRATION_STATE_FILE):
+        return default_state
+    try:
+        with open(_CALIBRATION_STATE_FILE, "r", encoding="utf-8") as state_file:
+            state = json.load(state_file)
+    except Exception:
+        return default_state
+    if not isinstance(state, dict):
+        return default_state
+    for key, value in default_state.items():
+        state.setdefault(key, value)
+    return state
+
+
+def _persist_calibration_state(
+    image_path: str | None,
+    pixel_df: pd.DataFrame,
+    meter_df: pd.DataFrame,
+    grid_spacing: float,
+) -> None:
+    _ensure_project_dirs()
+    payload = {
+        "image_path": image_path,
+        "pixel_points": pixel_df[["px", "py"]].to_dict(orient="records"),
+        "meter_points": meter_df[["x_m", "y_m"]].to_dict(orient="records"),
+        "grid_spacing_m": float(grid_spacing),
+        "updated_at": _timestamp(),
+    }
+    with open(_CALIBRATION_STATE_FILE, "w", encoding="utf-8") as state_file:
+        json.dump(payload, state_file, ensure_ascii=False, indent=2)
+
+
+def _build_calibration_preview_html(image_path: str | None, points: list[list[float]] | None = None) -> str:
+    image_url = _image_to_data_url(image_path)
+    points_json = json.dumps(points or [], ensure_ascii=False)
+    if image_url:
+        image_block = (
+            '<canvas id="calib-preview-canvas" style="width:100%;max-width:100%;border:1px solid #d0d7de;'
+            'border-radius:12px;display:block;background:#111;"></canvas>'
         )
+        status_text = "Klicke nacheinander auf 4 Referenzpunkte."
+    else:
+        image_block = (
+            '<div style="height:420px;display:flex;align-items:center;justify-content:center;'
+            'border:1px dashed #999;border-radius:12px;color:#666;background:#fafafa;">'
+            'Noch kein Bild geladen.</div>'
+        )
+        status_text = "Lade ein Bild in die Vorschau."
+    return (
+        f'<div id="calib-preview-root" data-image-url="{image_url}" data-points="{points_json}">'
+        f'<div style="margin-bottom:0.5rem;font-weight:600;">Kalibrierungs-Vorschau</div>'
+        f'<div style="margin-bottom:0.75rem;color:#666;font-size:0.92rem;">{status_text}</div>'
+        f'{image_block}'
+        f'</div>'
+    )
 
-    return preview
+
+def _load_calibration_ui_state() -> tuple[str, pd.DataFrame, pd.DataFrame, str, str, str]:
+    state = _load_calibration_state()
+    image_path = state.get("image_path")
+    pixel_points = state.get("pixel_points", [])
+    meter_points = state.get("meter_points", _DEFAULT_METER_PTS.to_dict(orient="records"))
+    pixel_df = _points_to_dataframe(pixel_points) if pixel_points else _empty_pixel_points_df()
+    meter_df = pd.DataFrame(meter_points)
+    if list(meter_df.columns) != ["x_m", "y_m"]:
+        meter_df = _DEFAULT_METER_PTS.copy()
+    preview_html = _build_calibration_preview_html(image_path, pixel_points)
+    points_json = json.dumps(pixel_points, ensure_ascii=False)
+    status = f"Gespeichert: {len(pixel_points)}/4 Referenzpunkte" if pixel_points else "Noch keine Referenzpunkte gespeichert."
+    return preview_html, pixel_df, meter_df, points_json, str(image_path or ""), status
+
+
+CALIBRATION_PREVIEW_HEAD = r"""
+<script>
+(function () {
+  function parsePoints(value) {
+    try { return value ? JSON.parse(value) : []; } catch (error) { return []; }
+  }
+
+  function drawPreview(root) {
+    const canvas = root.querySelector('#calib-preview-canvas');
+    const imageUrl = root.dataset.imageUrl || '';
+    if (!canvas || !imageUrl) return;
+
+    const points = parsePoints(root.dataset.points);
+    const ctx = canvas.getContext('2d');
+    const img = new Image();
+    img.onload = function () {
+      canvas.width = img.naturalWidth;
+      canvas.height = img.naturalHeight;
+      canvas.style.aspectRatio = `${img.naturalWidth} / ${img.naturalHeight}`;
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+      points.forEach((point, index) => {
+        const x = point[0];
+        const y = point[1];
+        ctx.beginPath();
+        ctx.arc(x, y, 8, 0, Math.PI * 2);
+        ctx.fillStyle = '#ff3b30';
+        ctx.fill();
+        ctx.lineWidth = 2;
+        ctx.strokeStyle = '#ffffff';
+        ctx.stroke();
+        ctx.fillStyle = '#ffffff';
+        ctx.font = 'bold 18px sans-serif';
+        ctx.fillText(String(index + 1), x + 12, y - 12);
+      });
+    };
+    img.src = imageUrl;
+
+    if (canvas.dataset.bound === '1') return;
+    canvas.dataset.bound = '1';
+    canvas.style.cursor = 'crosshair';
+    canvas.addEventListener('click', function (event) {
+      const root = document.getElementById('calib-preview-root');
+      if (!root) return;
+      const currentPoints = parsePoints(root.dataset.points);
+      if (currentPoints.length >= 4) return;
+
+      const rect = canvas.getBoundingClientRect();
+      const scaleX = canvas.width / rect.width;
+      const scaleY = canvas.height / rect.height;
+      const x = Math.round((event.clientX - rect.left) * scaleX);
+      const y = Math.round((event.clientY - rect.top) * scaleY);
+      currentPoints.push([x, y]);
+      root.dataset.points = JSON.stringify(currentPoints);
+
+      const pointsInput = document.querySelector('#calib-points-state textarea, #calib-points-state input');
+      if (pointsInput) {
+        pointsInput.value = JSON.stringify(currentPoints);
+        pointsInput.dispatchEvent(new Event('input', { bubbles: true }));
+      }
+      drawPreview(root);
+    });
+  }
+
+  function bind() {
+    const root = document.getElementById('calib-preview-root');
+    if (root) drawPreview(root);
+  }
+
+  setInterval(bind, 250);
+  document.addEventListener('DOMContentLoaded', bind);
+  bind();
+})();
+</script>
+"""
+
+
+_PACKAGE_DIR = os.path.dirname(os.path.abspath(__file__))
+_DATA_DIR = os.path.join(_PACKAGE_DIR, "data")
+_CALIBRATION_DIR = os.path.join(_DATA_DIR, "calibration")
+_TRAJECTORY_DIR = os.path.join(_DATA_DIR, "trajectories")
+_VIDEO_DIR = os.path.join(_DATA_DIR, "videos")
+_UPLOAD_DIR = os.path.join(_DATA_DIR, "uploads")
+_CALIBRATION_STATE_FILE = os.path.join(_CALIBRATION_DIR, "calibration_state.json")
+_CALIBRATION_IMAGE_FILE = os.path.join(_CALIBRATION_DIR, "current_calibration_image.png")
+
+
+def _ensure_project_dirs() -> None:
+    for path in (_CALIBRATION_DIR, _TRAJECTORY_DIR, _VIDEO_DIR, _UPLOAD_DIR):
+        os.makedirs(path, exist_ok=True)
+
+
+def _timestamp() -> str:
+    return datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+
+
+def _as_path(value: str | os.PathLike[str] | None) -> str | None:
+    return None if value is None else os.fspath(value)
+
+
+def _copy_uploaded_file(src_path: str | os.PathLike[str], dest_dir: str, prefix: str) -> str:
+    _ensure_project_dirs()
+    source = os.fspath(src_path)
+    _, ext = os.path.splitext(source)
+    dest_path = os.path.join(dest_dir, f"{prefix}_{_timestamp()}{ext or '.bin'}")
+    shutil.copy2(source, dest_path)
+    return dest_path
+
+
+def _empty_pixel_points_df() -> pd.DataFrame:
+    return pd.DataFrame({"px": [np.nan] * 4, "py": [np.nan] * 4})
+
+
+def _points_to_dataframe(points: list[list[float]]) -> pd.DataFrame:
+    rows = points[:4] + [[np.nan, np.nan]] * max(0, 4 - len(points))
+    return pd.DataFrame(rows, columns=["px", "py"])
+
+
+def _parse_click_state(points_json: str | None) -> list[list[float]]:
+    if not points_json:
+        return []
+    try:
+        points = json.loads(points_json)
+    except json.JSONDecodeError:
+        return []
+    if not isinstance(points, list):
+        return []
+    cleaned: list[list[float]] = []
+    for point in points:
+        if isinstance(point, (list, tuple)) and len(point) == 2:
+            try:
+                cleaned.append([float(point[0]), float(point[1])])
+            except (TypeError, ValueError):
+                continue
+    return cleaned[:4]
+
+
+def _image_to_data_url(image_path: str | None) -> str:
+    if image_path is None or not os.path.isfile(image_path):
+        return ""
+    import base64
+
+    with open(image_path, "rb") as image_file:
+        encoded = base64.b64encode(image_file.read()).decode("ascii")
+    _, ext = os.path.splitext(image_path)
+    mime = "image/png" if ext.lower() in {"", ".png"} else f"image/{ext.lower().lstrip('.') }"
+    return f"data:{mime};base64,{encoded}"
+
+
+def _save_calibration_image(source_path: str | None) -> str | None:
+    source = _as_path(source_path)
+    if source is None or not os.path.isfile(source):
+        return None
+    image = cv2.imread(source)
+    if image is None:
+        return None
+    _ensure_project_dirs()
+    cv2.imwrite(_CALIBRATION_IMAGE_FILE, image)
+    return _CALIBRATION_IMAGE_FILE
+
+
+def _load_calibration_state() -> dict:
+    default_state = {
+        "image_path": None,
+        "pixel_points": [],
+        "meter_points": _DEFAULT_METER_PTS.to_dict(orient="records"),
+        "grid_spacing_m": 1.0,
+    }
+    if not os.path.isfile(_CALIBRATION_STATE_FILE):
+        return default_state
+    try:
+        with open(_CALIBRATION_STATE_FILE, "r", encoding="utf-8") as state_file:
+            state = json.load(state_file)
+    except Exception:
+        return default_state
+    if not isinstance(state, dict):
+        return default_state
+    for key, value in default_state.items():
+        state.setdefault(key, value)
+    return state
+
+
+def _persist_calibration_state(
+    image_path: str | None,
+    pixel_df: pd.DataFrame,
+    meter_df: pd.DataFrame,
+    grid_spacing: float,
+) -> None:
+    _ensure_project_dirs()
+    payload = {
+        "image_path": image_path,
+        "pixel_points": pixel_df[["px", "py"]].to_dict(orient="records"),
+        "meter_points": meter_df[["x_m", "y_m"]].to_dict(orient="records"),
+        "grid_spacing_m": float(grid_spacing),
+        "updated_at": _timestamp(),
+    }
+    with open(_CALIBRATION_STATE_FILE, "w", encoding="utf-8") as state_file:
+        json.dump(payload, state_file, ensure_ascii=False, indent=2)
+
+
+def _build_calibration_preview_html(image_path: str | None, points: list[list[float]] | None = None) -> str:
+    image_url = _image_to_data_url(image_path)
+    points_json = json.dumps(points or [], ensure_ascii=False)
+    if image_url:
+        image_block = (
+            '<canvas id="calib-preview-canvas" style="width:100%;max-width:100%;border:1px solid #d0d7de;'
+            'border-radius:12px;display:block;background:#111;"></canvas>'
+        )
+        status_text = "Klicke nacheinander auf 4 Referenzpunkte."
+    else:
+        image_block = (
+            '<div style="height:420px;display:flex;align-items:center;justify-content:center;'
+            'border:1px dashed #999;border-radius:12px;color:#666;background:#fafafa;">'
+            'Noch kein Bild geladen.</div>'
+        )
+        status_text = "Lade ein Bild in die Vorschau."
+    return (
+        f'<div id="calib-preview-root" data-image-url="{image_url}" data-points="{points_json}">'
+        f'<div style="margin-bottom:0.5rem;font-weight:600;">Kalibrierungs-Vorschau</div>'
+        f'<div style="margin-bottom:0.75rem;color:#666;font-size:0.92rem;">{status_text}</div>'
+        f'{image_block}'
+        f'</div>'
+    )
+
+
+def _load_calibration_ui_state() -> tuple[str, pd.DataFrame, pd.DataFrame, str, str, str]:
+    state = _load_calibration_state()
+    image_path = state.get("image_path")
+    pixel_points = state.get("pixel_points", [])
+    meter_points = state.get("meter_points", _DEFAULT_METER_PTS.to_dict(orient="records"))
+    pixel_df = _points_to_dataframe(pixel_points) if pixel_points else _empty_pixel_points_df()
+    meter_df = pd.DataFrame(meter_points) if meter_points else _DEFAULT_METER_PTS.copy()
+    if list(meter_df.columns) != ["x_m", "y_m"]:
+        meter_df = _DEFAULT_METER_PTS.copy()
+
+    points_json = json.dumps(pixel_points, ensure_ascii=False)
+    preview_html = _build_calibration_preview_html(image_path, pixel_points)
+    status = f"Gespeichert: {len(pixel_points)}/4 Referenzpunkte" if pixel_points else "Noch keine Referenzpunkte gespeichert."
+    return preview_html, pixel_df, meter_df, points_json, str(image_path or ""), status
+
+
+def _open_calibration_preview(
+    image_file: str | None,
+    current_meter_df: pd.DataFrame,
+    grid_spacing: float,
+) -> tuple[str, pd.DataFrame, str, str, str]:
+    if image_file is None:
+        raise gr.Error("Bitte zuerst ein Bild auswählen.")
+
+    image_path = _as_path(image_file)
+    if image_path is None or not os.path.isfile(image_path):
+        raise gr.Error("Das ausgewählte Bild konnte nicht gelesen werden.")
+
+    saved_image = _save_calibration_image(image_path)
+    if saved_image is None:
+        raise gr.Error("Das Bild konnte nicht in data/calibration gespeichert werden.")
+
+    empty_points = _empty_pixel_points_df()
+    _persist_calibration_state(saved_image, empty_points, current_meter_df, grid_spacing)
+
+    preview_html = _build_calibration_preview_html(saved_image, [])
+    return (
+        preview_html,
+        empty_points,
+        json.dumps([], ensure_ascii=False),
+        saved_image,
+        "Bild geladen. Jetzt die 4 Punkte im Bild anklicken.",
+    )
+
+
+def _reset_calibration_points(
+    image_path: str | None,
+    meter_df: pd.DataFrame,
+    grid_spacing: float,
+) -> tuple[str, pd.DataFrame, str, str]:
+    empty_points = _empty_pixel_points_df()
+    _persist_calibration_state(image_path or None, empty_points, meter_df, grid_spacing)
+    preview_html = _build_calibration_preview_html(image_path, [])
+    return preview_html, empty_points, json.dumps([], ensure_ascii=False), "Punkte zurückgesetzt."
+
+
+def _save_current_calibration_state(
+    image_path: str | None,
+    pixel_df: pd.DataFrame,
+    meter_df: pd.DataFrame,
+    grid_spacing: float,
+) -> str:
+    if image_path:
+        _save_calibration_image(image_path)
+    _persist_calibration_state(image_path or None, pixel_df, meter_df, grid_spacing)
+    return "Kalibrierungszustand gespeichert."
 
 
 # ---------------------------------------------------------------------------
@@ -152,16 +517,16 @@ def _render_click_preview(frame_path: str | None, points: list[list[float]]) -> 
 # ---------------------------------------------------------------------------
 
 def _run_calibration(
-    frame_img: str | None,
+    image_path: str | None,
     pixel_df: pd.DataFrame,
     meter_df: pd.DataFrame,
     grid_spacing: float,
 ) -> tuple[np.ndarray | None, str | None]:
     """Compute homography and return (BEV image, calibration .npy path)."""
-    if frame_img is None:
+    if image_path is None:
         raise gr.Error("Please upload a video frame image.")
 
-    frame_path = _as_path(frame_img)
+    frame_path = _as_path(image_path)
     if frame_path is None or not os.path.isfile(frame_path):
         raise gr.Error("Please upload a valid video frame image.")
 
@@ -179,7 +544,7 @@ def _run_calibration(
     bev = validate_calibration(frame, H, grid_spacing_m=grid_spacing)
 
     _ensure_project_dirs()
-    _copy_uploaded_file(frame_path, _CALIBRATION_DIR, "calibration_frame")
+    saved_image = _save_calibration_image(frame_path)
 
     stamp = _timestamp()
     npy_path = os.path.join(_CALIBRATION_DIR, f"homography_{stamp}.npy")
@@ -195,25 +560,28 @@ def _run_calibration(
     with open(params_path, "w", encoding="utf-8") as params_file:
         json.dump(params_payload, params_file, ensure_ascii=False, indent=2)
 
+    if saved_image is not None:
+        _persist_calibration_state(saved_image, pixel_df, meter_df, grid_spacing)
+
     return bev, npy_path
 
 
 def _sync_clicked_points(
-    frame_img: str | None,
+    image_path: str | None,
     points_json: str | None,
-) -> tuple[pd.DataFrame, np.ndarray | None, str]:
+    meter_df: pd.DataFrame,
+    grid_spacing: float,
+) -> tuple[pd.DataFrame, str, str]:
     points = _parse_click_state(points_json)
-    if not points:
-        return (
-            _DEFAULT_PIXEL_PTS.copy(),
-            _render_click_preview(_as_path(frame_img), []),
-            "Klicke 4 Referenzpunkte der Reihe nach in das Bild.",
-        )
-
-    pixel_df = _points_to_dataframe(points)
-    preview = _render_click_preview(_as_path(frame_img), points)
-    status = f"Referenzpunkte gesetzt: {len(points)}/4"
-    return pixel_df, preview, status
+    pixel_df = _points_to_dataframe(points) if points else _empty_pixel_points_df()
+    _persist_calibration_state(image_path or None, pixel_df, meter_df, grid_spacing)
+    preview_html = _build_calibration_preview_html(image_path, points)
+    status = (
+        f"Referenzpunkte gesetzt: {len(points)}/4"
+        if points
+        else "Klicke 4 Referenzpunkte der Reihe nach in das Bild."
+    )
+    return pixel_df, preview_html, status
 
 
 # ---------------------------------------------------------------------------
@@ -444,6 +812,15 @@ _DEFAULT_METER_PTS = pd.DataFrame(
     {"x_m": [0.0, 4.0, 4.0, 0.0], "y_m": [0.0, 0.0, 3.0, 3.0]}
 )
 
+(
+    INITIAL_CALIB_PREVIEW_HTML,
+    INITIAL_PIXEL_POINTS_DF,
+    INITIAL_METER_POINTS_DF,
+    INITIAL_POINTS_JSON,
+    INITIAL_IMAGE_PATH,
+    INITIAL_POINT_STATUS,
+) = _load_calibration_ui_state()
+
 click_sync_js = r"""
 (() => {
     const bindCalibrationClicks = () => {
@@ -507,7 +884,7 @@ click_sync_js = r"""
 })();
 """
 
-with gr.Blocks(title="Pedestrian Crossing Analysis", theme=gr.themes.Default(), js=click_sync_js) as demo:
+with gr.Blocks(title="Pedestrian Crossing Analysis", theme=gr.themes.Default(), head=CALIBRATION_PREVIEW_HEAD) as demo:
     gr.Markdown("# 🚶 Pedestrian Crossing Trajectory Analysis")
     gr.Markdown(
         "Analyse drone-captured BEV footage of pedestrian crossing scenarios. "
@@ -520,30 +897,34 @@ with gr.Blocks(title="Pedestrian Crossing Analysis", theme=gr.themes.Default(), 
         with gr.Row():
             with gr.Column():
                 calib_frame = gr.Image(
-                    label="Video Frame (upload as image)",
+                    label="Bild auswählen",
                     type="filepath",
                     sources=["upload"],
-                    elem_id="calib-frame",
+                    elem_id="calib-upload",
+                )
+                preview_image_path = gr.Textbox(
+                    value=INITIAL_IMAGE_PATH,
+                    visible=False,
+                    elem_id="calib-image-path",
                 )
                 calib_points_state = gr.Textbox(
-                    value="[]",
+                    value=INITIAL_POINTS_JSON,
                     visible=False,
                     elem_id="calib-points-state",
                 )
                 pixel_pts_df = gr.Dataframe(
-                    value=_DEFAULT_PIXEL_PTS,
+                    value=INITIAL_PIXEL_POINTS_DF,
                     label="4 Pixel Points (px, py)",
                     col_count=(2, "fixed"),
                     interactive=True,
                 )
                 point_status = gr.Textbox(
-                    value="Klicke 4 Referenzpunkte der Reihe nach in das Bild.",
+                    value=INITIAL_POINT_STATUS,
                     label="Punkt-Status",
                     interactive=False,
                 )
-                click_preview = gr.Image(label="Klick-Vorschau", interactive=False)
                 meter_pts_df = gr.Dataframe(
-                    value=_DEFAULT_METER_PTS,
+                    value=INITIAL_METER_POINTS_DF,
                     label="4 Meter Points (x_m, y_m)",
                     col_count=(2, "fixed"),
                     interactive=True,
@@ -552,20 +933,43 @@ with gr.Blocks(title="Pedestrian Crossing Analysis", theme=gr.themes.Default(), 
                     minimum=0.5, maximum=5.0, step=0.5, value=1.0,
                     label="Grid spacing (m)",
                 )
+                with gr.Row():
+                    open_btn = gr.Button("Bild in Vorschau öffnen", variant="primary")
+                    reset_btn = gr.Button("Punkte zurücksetzen")
+                    save_btn = gr.Button("Zustand speichern")
                 calib_btn = gr.Button("Kalibrierung berechnen", variant="primary")
             with gr.Column():
+                preview_html = gr.HTML(value=INITIAL_CALIB_PREVIEW_HTML)
                 bev_output = gr.Image(label="BEV Validation Grid")
                 calib_file_out = gr.File(label="Download Homography (.npy)")
 
+        open_btn.click(
+            fn=_open_calibration_preview,
+            inputs=[calib_frame, meter_pts_df, grid_slider],
+            outputs=[preview_html, pixel_pts_df, calib_points_state, preview_image_path, point_status],
+        )
+
         calib_points_state.change(
             fn=_sync_clicked_points,
-            inputs=[calib_frame, calib_points_state],
-            outputs=[pixel_pts_df, click_preview, point_status],
+            inputs=[preview_image_path, calib_points_state, meter_pts_df, grid_slider],
+            outputs=[pixel_pts_df, preview_html, point_status],
+        )
+
+        reset_btn.click(
+            fn=_reset_calibration_points,
+            inputs=[preview_image_path, meter_pts_df, grid_slider],
+            outputs=[preview_html, pixel_pts_df, calib_points_state, point_status],
+        )
+
+        save_btn.click(
+            fn=_save_current_calibration_state,
+            inputs=[preview_image_path, pixel_pts_df, meter_pts_df, grid_slider],
+            outputs=point_status,
         )
 
         calib_btn.click(
             fn=_run_calibration,
-            inputs=[calib_frame, pixel_pts_df, meter_pts_df, grid_slider],
+            inputs=[preview_image_path, pixel_pts_df, meter_pts_df, grid_slider],
             outputs=[bev_output, calib_file_out],
         )
 
